@@ -86,6 +86,7 @@
 -type portnum()  :: kpro:portnum().
 -type client_id() :: kpro:client_id().
 -type connection() :: pid().
+-type post_drain_queue() :: list().
 
 -define(undef, undefined).
 
@@ -98,6 +99,7 @@
                , req_timeout :: ?undef | timeout()
                , api_vsns    :: ?undef | kpro:vsn_ranges()
                , requests    :: ?undef | requests()
+               , draining    :: false | {drain | flush_queue, post_drain_queue()} 
                }).
 
 -type state() :: #state{}.
@@ -225,11 +227,12 @@ connect(Parent, Host, Port, Config) ->
   SockOpts = [{active, false}, binary] ++ get_extra_sock_opts(Config),
   case gen_tcp:connect(Host, Port, SockOpts, Timeout) of
     {ok, Sock} ->
-      State = #state{ client_id = get_client_id(Config)
-                    , parent    = Parent
-                    , remote    = {Host, Port}
-                    , config    = Config
-                    , sock      = Sock
+      State = #state{ client_id    = get_client_id(Config)
+                    , parent       = Parent
+                    , remote       = {Host, Port}
+                    , config       = Config
+                    , sock         = Sock
+                    , draining     = false
                     },
       init_connection(State, Config, Deadline);
     {error, Reason} ->
@@ -380,9 +383,25 @@ maybe_reply({To, Ref}, Reply) ->
   _ = erlang:send(To, {Ref, Reply}),
   ok.
 
-loop(#state{} = State, Debug) ->
+loop(#state{draining = false} = State, Debug) ->
   Msg = receive Input -> Input end,
-  decode_msg(Msg, State, Debug).
+  decode_msg(Msg, State, Debug);
+
+loop(#state{draining = {_DrainState, DrainQueue}, requests = Requests} = State, Debug) ->
+  case kpro_sent_reqs:is_empty(Requests) of  
+    true ->
+      case DrainQueue of 
+        [Msg | Rest] ->
+          %% decode calls back to loop which recursively flushes Rest
+           decode_msg(Msg, State#state{draining = {flush_queue, Rest}}, Debug);
+        [] ->
+          %% Queue has been flushed, draining is complete
+          loop(State#state{draining = false}, Debug)
+      end;
+    false ->
+      Msg = receive Input -> Input end,
+      decode_msg(Msg, State, Debug)
+  end.
 
 decode_msg({system, From, Msg}, #state{parent = Parent} = State, Debug) ->
   sys:handle_system_msg(Msg, From, Parent, ?MODULE, Debug, State);
@@ -420,6 +439,9 @@ handle_msg({tcp_error, Sock, Reason}, #state{sock = Sock}, _) ->
   exit({tcp_error, Reason});
 handle_msg({ssl_error, Sock, Reason}, #state{sock = Sock}, _) ->
   exit({ssl_error, Reason});
+handle_msg({_From, {send, _}} = Msg, #state{ draining = {drain, _}} = State, Debug) ->
+  %% Avoid sending new requests until in-flight requests have been resolved
+  ?MODULE:loop(drain_and_postpone(Msg, State), Debug);
 handle_msg({From, {send, Request}},
            #state{ client_id = ClientId
                  , mod       = Mod
@@ -465,6 +487,10 @@ handle_msg({From, stop}, #state{mod = Mod, sock = Sock}, _Debug) ->
   Mod:close(Sock),
   maybe_reply(From, ok),
   ok;
+handle_msg(sasl_authenticate, #state{draining = {flush_queue, _}} = State, Debug) ->
+  ?MODULE:loop(sasl_authenticate(State), Debug);
+handle_msg(sasl_authenticate, State, Debug) ->
+  ?MODULE:loop(drain_and_postpone(sasl_authenticate, State), Debug);
 handle_msg(Msg, #state{} = State, Debug) ->
   error_logger:warning_msg("[~p] ~p got unrecognized message: ~p",
                           [?MODULE, self(), Msg]),
@@ -483,11 +509,27 @@ sasl_authenticate(#state{client_id = ClientId, mod = Mod, sock = Sock, remote = 
                       timeout(Deadline), SaslOpts, HandshakeVsn) of
     ok ->
       ok;
-    {ok, _ServerResponse} ->
-      ok
+    {ok, ServerResponse} ->
+      case find(session_lifetime_ms, ServerResponse) of
+        Lifetime when is_integer(Lifetime) andalso Lifetime > 0 ->
+          %% Broker can report back a maximal session lifetime: https://kafka.apache.org/protocol#The_Messages_SaslAuthenticate.
+          %% Respect the session lifetime by draining in-flight requests and re-authenticating in half the time.
+          ReauthenticationDeadline = Lifetime div 2,
+          _ = erlang:send_after(ReauthenticationDeadline, self(), sasl_authenticate),
+          ok;
+        _ ->
+          ok
+      end
   end,
   ok = setopts(Sock, Mod, [{active, once}]), 
   State.
+
+drain_and_postpone(Msg, #state{draining = false} = State) ->
+  DrainQueue = [Msg],
+  State#state{draining = {drain, DrainQueue}};
+drain_and_postpone(Msg, #state{draining = {drain, DrainQueue}} = State) ->
+  DrainQueue = lists:append(DrainQueue, [Msg]),
+  State#state{draining = {drain, DrainQueue}}.
 
 cast(Pid, Msg) ->
   try
@@ -515,6 +557,8 @@ print_msg(Device, {_From, {send, Request}}, State) ->
   do_print_msg(Device, "send: ~p", [Request], State);
 print_msg(Device, {_From, {get_api_vsns, Request}}, State) ->
   do_print_msg(Device, "get_api_vsns", [Request], State);
+print_msg(Device, sasl_authenticate, State) ->
+  do_print_msg(Device, "sasl_authenticate", [], State);
 print_msg(Device, {tcp, _Sock, Bin}, State) ->
   do_print_msg(Device, "tcp: ~p", [Bin], State);
 print_msg(Device, {ssl, _Sock, Bin}, State) ->
