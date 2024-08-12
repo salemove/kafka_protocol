@@ -17,6 +17,8 @@
 -include_lib("eunit/include/eunit.hrl").
 -include("kpro_private.hrl").
 
+-export([ auth/7 ]).
+
 plaintext_test() ->
   Config = kpro_test_lib:connection_config(plaintext),
   {ok, Pid} = connect(Config),
@@ -57,6 +59,33 @@ sasl_file_test() ->
       ok = kpro_connection:stop(Pid)
   end.
 
+% SASL callback implementation for subsequent tests
+auth(_Host, _Sock, _Vsn, _Mod, _ClientName, _Timeout, #{test_pid := TestPid} = SaslOpts) ->
+  case SaslOpts of
+    #{response_session_lifetime_ms := ResponseSessionLifeTimeMs} ->
+      TestPid ! sasl_authenticated,
+      {ok, #{session_lifetime_ms => ResponseSessionLifeTimeMs}};
+    _ ->
+      ok
+  end.
+
+sasl_callback_test() ->
+  Config0 = kpro_test_lib:connection_config(sasl_ssl),
+  case kpro_test_lib:get_kafka_version() of
+    ?KAFKA_0_9 ->
+      ok;
+    _ ->
+      Config = Config0#{sasl => {callback, ?MODULE, #{response_session_lifetime_ms => 51, test_pid => self()}}},
+      {ok, Pid} = connect(Config),
+
+      % initial authentication
+      receive sasl_authenticated -> ok end,
+      % repeated authentication as session expires
+      receive sasl_authenticated -> ok end,
+
+      ok = kpro_connection:stop(Pid)
+  end.
+
 no_api_version_query_test() ->
   Config = #{query_api_versions => false},
   {ok, Pid} = connect(Config),
@@ -72,21 +101,6 @@ extra_sock_opts_test() ->
   {ok, InetSockOpts} = inet:getopts(Sock, [delay_send]),
   ?assertEqual(true, proplists:get_value(delay_send, InetSockOpts)),
   ok = kpro_connection:stop(Pid).
-
-sasl_reauthenticate_after_test() ->
-  Config0 = kpro_test_lib:connection_config(ssl),
-  case kpro_test_lib:get_kafka_version() of
-    ?KAFKA_0_9 ->
-      ok;
-    ?KAFKA_0_10 ->
-      {ok, Pid} = connect(Config0#{sasl => kpro_test_lib:sasl_config(file)}),
-      ok = kpro_connection:sasl_reauthenticate_after(Pid, 1000),
-      ok = kpro_connection:stop(Pid);
-    _ ->
-      {ok, Pid} = connect(Config0#{sasl => kpro_test_lib:sasl_config(file)}),
-      ok = kpro_connection:sasl_reauthenticate_after(Pid, 1000),
-      ok = kpro_connection:stop(Pid)
-  end.
 
 connect(Config) ->
   Protocol = kpro_test_lib:guess_protocol(Config),
