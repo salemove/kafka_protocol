@@ -33,7 +33,6 @@
         , get_corr_id/1
         , increment_corr_id/1
         , scan_for_max_age/1
-        , is_empty/1
         ]).
 
 -export_type([requests/0]).
@@ -56,9 +55,6 @@
 
 -spec new() -> requests().
 new() -> #requests{}.
-
--spec is_empty(requests()) -> boolean().
-is_empty(#requests{sent = Sent}) -> maps:size(Sent) == 0.
 
 %% @doc Add a new request to sent collection.
 %% Return the last corrlation ID and the new collection.
