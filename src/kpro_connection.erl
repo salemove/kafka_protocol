@@ -42,7 +42,9 @@
              ]).
 
 -include("kpro_private.hrl").
+-ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+-endif.
 
 -define(DEFAULT_CONNECT_TIMEOUT, timer:seconds(5)).
 -define(DEFAULT_REQUEST_TIMEOUT, timer:minutes(4)).
@@ -86,7 +88,6 @@
 -type portnum()  :: kpro:portnum().
 -type client_id() :: kpro:client_id().
 -type connection() :: pid().
--type post_drain_queue() :: list().
 
 -define(undef, undefined).
 
@@ -99,7 +100,7 @@
                , req_timeout :: ?undef | timeout()
                , api_vsns    :: ?undef | kpro:vsn_ranges()
                , requests    :: ?undef | requests()
-               , draining    :: false | {drain | flush_queue, post_drain_queue()} 
+               , backlog     :: false | queue:queue()
                }).
 
 -type state() :: #state{}.
@@ -227,12 +228,12 @@ connect(Parent, Host, Port, Config) ->
   SockOpts = [{active, false}, binary] ++ get_extra_sock_opts(Config),
   case gen_tcp:connect(Host, Port, SockOpts, Timeout) of
     {ok, Sock} ->
-      State = #state{ client_id    = get_client_id(Config)
-                    , parent       = Parent
-                    , remote       = {Host, Port}
-                    , config       = Config
-                    , sock         = Sock
-                    , draining     = false
+      State = #state{ client_id   = get_client_id(Config)
+                    , parent      = Parent
+                    , remote      = {Host, Port}
+                    , config      = Config
+                    , sock        = Sock
+                    , backlog     = false
                     },
       init_connection(State, Config, Deadline);
     {error, Reason} ->
@@ -383,25 +384,9 @@ maybe_reply({To, Ref}, Reply) ->
   _ = erlang:send(To, {Ref, Reply}),
   ok.
 
-loop(#state{draining = false} = State, Debug) ->
+loop(#state{} = State, Debug) ->
   Msg = receive Input -> Input end,
-  decode_msg(Msg, State, Debug);
-
-loop(#state{draining = {_DrainState, DrainQueue}, requests = Requests} = State, Debug) ->
-  case kpro_sent_reqs:is_empty(Requests) of  
-    true ->
-      case DrainQueue of 
-        [Msg | Rest] ->
-          %% decode calls back to loop which recursively flushes Rest
-           decode_msg(Msg, State#state{draining = {flush_queue, Rest}}, Debug);
-        [] ->
-          %% Queue has been flushed, draining is complete
-          loop(State#state{draining = false}, Debug)
-      end;
-    false ->
-      Msg = receive Input -> Input end,
-      decode_msg(Msg, State, Debug)
-  end.
+  decode_msg(Msg, State, Debug).
 
 decode_msg({system, From, Msg}, #state{parent = Parent} = State, Debug) ->
   sys:handle_system_msg(Msg, From, Parent, ?MODULE, Debug, State);
@@ -421,7 +406,8 @@ handle_msg({_, Sock, Bin}, #state{ sock     = Sock
   Rsp = kpro_rsp_lib:decode(API, Vsn, Body, Ref),
   ok = cast(Caller, {msg, self(), Rsp}),
   NewRequests = kpro_sent_reqs:del(Requests, CorrId),
-  ?MODULE:loop(State#state{requests = NewRequests}, Debug);
+  State1 = maybe_flush_backlog(State#state{requests = NewRequests}),
+  ?MODULE:loop(State1, Debug);
 handle_msg(assert_max_req_age, #state{ requests = Requests
                                      , req_timeout = ReqTimeout
                                      } = State, Debug) ->
@@ -439,15 +425,41 @@ handle_msg({tcp_error, Sock, Reason}, #state{sock = Sock}, _) ->
   exit({tcp_error, Reason});
 handle_msg({ssl_error, Sock, Reason}, #state{sock = Sock}, _) ->
   exit({ssl_error, Reason});
-handle_msg({_From, {send, _}} = Msg, #state{ draining = {drain, _}} = State, Debug) ->
+handle_msg({_From, {send, _}} = Msg, #state{backlog = false} = State, Debug) ->
+  State1 = send_request(Msg, State),
+  ?MODULE:loop(State1, Debug);
+handle_msg({_From, {send, _}} = Msg, #state{backlog = Q} = State, Debug) ->
   %% Avoid sending new requests until in-flight requests have been resolved
-  ?MODULE:loop(drain_and_postpone(Msg, State), Debug);
-handle_msg({From, {send, Request}},
-           #state{ client_id = ClientId
-                 , mod       = Mod
-                 , sock      = Sock
-                 , requests  = Requests
-                 } = State, Debug) ->
+  State1 = State#state{backlog = queue:in(Msg, Q)},
+  ?MODULE:loop(State1, Debug);
+handle_msg({From, get_api_vsns}, State, Debug) ->
+  maybe_reply(From, {ok, State#state.api_vsns}),
+  ?MODULE:loop(State, Debug);
+handle_msg({From, get_endpoint}, State, Debug) ->
+  maybe_reply(From, {ok, State#state.remote}),
+  ?MODULE:loop(State, Debug);
+handle_msg({From, get_tcp_sock}, State, Debug) ->
+  maybe_reply(From, {ok, State#state.sock}),
+  ?MODULE:loop(State, Debug);
+handle_msg({From, stop}, #state{mod = Mod, sock = Sock}, _Debug) ->
+  Mod:close(Sock),
+  maybe_reply(From, ok),
+  ok;
+handle_msg(sasl_authenticate, State, Debug) ->
+  State1 = State#state{backlog = queue:from_list([sasl_authenticate])},
+  State2 = maybe_flush_backlog(State1),
+  ?MODULE:loop(State2, Debug);
+handle_msg(Msg, #state{} = State, Debug) ->
+  error_logger:warning_msg("[~p] ~p got unrecognized message: ~p",
+                          [?MODULE, self(), Msg]),
+  ?MODULE:loop(State, Debug).
+
+send_request({From, {send, Request}},
+             #state{ client_id = ClientId
+                     , mod       = Mod
+                     , sock      = Sock
+                     , requests  = Requests
+                   } = State) ->
   {Caller, _Ref} = From,
   #kpro_req{api = API, vsn = Vsn} = Request,
   {CorrId, NewRequests} =
@@ -473,28 +485,25 @@ handle_msg({From, {send, Request}},
                ],
       exit({send_error, Reason})
   end,
-  ?MODULE:loop(State#state{requests = NewRequests}, Debug);
-handle_msg({From, get_api_vsns}, State, Debug) ->
-  maybe_reply(From, {ok, State#state.api_vsns}),
-  ?MODULE:loop(State, Debug);
-handle_msg({From, get_endpoint}, State, Debug) ->
-  maybe_reply(From, {ok, State#state.remote}),
-  ?MODULE:loop(State, Debug);
-handle_msg({From, get_tcp_sock}, State, Debug) ->
-  maybe_reply(From, {ok, State#state.sock}),
-  ?MODULE:loop(State, Debug);
-handle_msg({From, stop}, #state{mod = Mod, sock = Sock}, _Debug) ->
-  Mod:close(Sock),
-  maybe_reply(From, ok),
-  ok;
-handle_msg(sasl_authenticate, #state{draining = {flush_queue, _}} = State, Debug) ->
-  ?MODULE:loop(sasl_authenticate(State), Debug);
-handle_msg(sasl_authenticate, State, Debug) ->
-  ?MODULE:loop(drain_and_postpone(sasl_authenticate, State), Debug);
-handle_msg(Msg, #state{} = State, Debug) ->
-  error_logger:warning_msg("[~p] ~p got unrecognized message: ~p",
-                          [?MODULE, self(), Msg]),
-  ?MODULE:loop(State, Debug).
+  State#state{requests = NewRequests}.
+
+maybe_flush_backlog(#state{backlog = false} = State) ->
+  State;
+maybe_flush_backlog(#state{requests = Requests, backlog = Backlog} = State) ->
+  case kpro_sent_reqs:is_empty(Requests) of  
+    true ->
+      NewState = case queue:out(Backlog) of
+        {{value, sasl_authenticate}, RemainingBacklog} ->
+          sasl_authenticate(State#state{backlog = RemainingBacklog});
+        {{value, {_From, {send, _}} = Msg}, RemainingBacklog} ->
+          send_request(Msg, State#state{backlog = RemainingBacklog});
+        {empty, _} ->
+          State#state{backlog = false}
+      end,
+      maybe_flush_backlog(NewState);
+    false ->
+      State
+  end.
 
 sasl_authenticate(#state{client_id = ClientId, mod = Mod, sock = Sock, remote = {Host, _Port}, api_vsns = Versions, config = Config} = State) ->
   Timeout = get_connect_timeout(Config),
@@ -523,13 +532,6 @@ sasl_authenticate(#state{client_id = ClientId, mod = Mod, sock = Sock, remote = 
   end,
   ok = setopts(Sock, Mod, [{active, once}]), 
   State.
-
-drain_and_postpone(Msg, #state{draining = false} = State) ->
-  DrainQueue = [Msg],
-  State#state{draining = {drain, DrainQueue}};
-drain_and_postpone(Msg, #state{draining = {drain, DrainQueue}} = State) ->
-  DrainQueue = lists:append(DrainQueue, [Msg]),
-  State#state{draining = {drain, DrainQueue}}.
 
 cast(Pid, Msg) ->
   try

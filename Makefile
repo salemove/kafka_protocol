@@ -1,4 +1,4 @@
-KAFKA_VERSION ?= 2.4
+export KAFKA_VERSION ?= 2.4
 all: compile
 
 rebar ?= $(shell which rebar3)
@@ -51,6 +51,10 @@ distclean: clean
 edoc: profile=edown
 edoc:
 	@$(rebar_cmd) edoc
+
+.PHONY: ex_doc
+ex_doc:
+	@$(rebar_cmd) ex_doc
 
 .PHONY: dialyze
 dialyze: compile
